@@ -1,0 +1,73 @@
+{
+  "Topology": {
+    "HOSubnets": [
+      "10.192.10.0/23",
+      "10.192.15.0/24",
+      "10.192.16.0/24",
+      "10.192.17.0/24",
+      "10.192.18.0/24"
+    ],
+    "RemoteSubnets": [
+      "10.192.13.0/24",
+      "10.192.20.0/24",
+      "10.192.21.0/24",
+      "10.192.22.0/24",
+      "10.192.25.0/24",
+      "10.192.30.0/24",
+      "10.192.35.0/24",
+      "10.192.38.0/24"
+    ],
+    "HOThrottleLimit": 40,
+    "RemoteThrottleLimit": 4,
+    "CIMSessionTimeout": 15,
+    "InvokeCommandTimeout": 30
+  },
+  "Security": {
+    "AdminGroup": "EMS_Admins",
+    "AuditLogPath": "C:\\EMSLogs",
+    "EnableRemediation": true,
+    "RequireConfirmation": true
+  },
+  "UserResolution": {
+    "UseSCCM": true,
+    "SCCMSiteServer": "SCCM01.corp.local",
+    "EventLogTimeWindowMinutes": 60,
+    "TimeoutSeconds": 30,
+    "FallbackToDC": true
+  },
+  "BlacklistedSoftware": [
+    "Dropbox",
+    "Steam",
+    "Tor Browser",
+    "TeamViewer",
+    "AnyDesk"
+  ],
+  "Diagnostics": {
+    "UptimeThresholdDays": 30,
+    "DiskSpaceThresholdPercent": 10,
+    "CPUThresholdPercent": 90,
+    "MemoryThresholdPercent": 85,
+    "TempFolderSizeThresholdGB": 1,
+    "ProfileSizeThresholdGB": 5
+  },
+  "Remediation": {
+    "CriticalServices": [
+      "Spooler",
+      "WinRM",
+      "wuauserv",
+      "CcmExec"
+    ],
+    "AllowServiceRestart": true,
+    "AllowProcessKill": true,
+    "AllowDiskCleanup": true,
+    "AllowGPORefresh": true,
+    "AllowReboot": false
+  },
+  "BulkProcessing": {
+    "EnableBulkImport": true,
+    "MaxTargetsPerBatch": 500,
+    "HOBatchSize": 40,
+    "RemoteBatchSize": 4,
+    "DelayBetweenRemoteBatchesSeconds": 5
+  }
+}
