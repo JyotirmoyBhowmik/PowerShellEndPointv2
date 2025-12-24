@@ -141,7 +141,107 @@ function Start-HOQueue {
     $results = $jobs | Receive-Job
     $jobs | Remove-Job
     
+    # Save diagnostics to granular metric tables
+    foreach ($result in $results) {
+        if ($result.Status -eq 'Complete') {
+            Save-DiagnosticsToMetrics -ScanResult $result -Config $Config
+        }
+    }
+    
     return $results
+}
+
+function Save-DiagnosticsToMetrics {
+    <#
+    .SYNOPSIS
+        Saves diagnostic scan results to granular metric tables
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$ScanResult,
+        
+        [Parameter(Mandatory)]
+        [PSCustomObject]$Config
+    )
+    
+    try {
+        # Import metrics module
+        Import-Module "$PSScriptRoot\Database\MetricsData.psm1" -Force
+        
+        $computerName = $ScanResult.Hostname
+        
+        # Register/update computer
+        Register-Computer -ComputerName $computerName `
+            -IPAddress $ScanResult.IP `
+            -OperatingSystem "Windows" `
+            -IsDomainJoined $true `
+            -ComputerType "Desktop"
+        
+        # Extract and save metrics from diagnostic results
+        foreach ($diagnostic in $ScanResult.SystemHealth) {
+            switch ($diagnostic.CheckName) {
+                "CPU_Usage" {
+                    if ($diagnostic.Details) {
+                        Save-CPUMetric -ComputerName $computerName `
+                            -UsagePercent ([decimal]$diagnostic.Details.UsagePercent) `
+                            -CoreCount $diagnostic.Details.CoreCount `
+                            -LogicalProcessors $diagnostic.Details.LogicalProcessors `
+                            -ProcessorName $diagnostic.Details.ProcessorName `
+                            -ProcessorSpeedMHz $diagnostic.Details.SpeedMHz
+                    }
+                }
+                "Memory_Usage" {
+                    if ($diagnostic.Details) {
+                        Save-MemoryMetric -ComputerName $computerName `
+                            -TotalGB ([decimal]$diagnostic.Details.TotalGB) `
+                            -AvailableGB ([decimal]$diagnostic.Details.AvailableGB) `
+                            -UsedGB ([decimal]$diagnostic.Details.UsedGB) `
+                            -UsagePercent ([decimal]$diagnostic.Details.UsagePercent)
+                    }
+                }
+                "Disk_Space" {
+                    if ($diagnostic.Details -and $diagnostic.Details.Disks) {
+                        Save-DiskMetrics -ComputerName $computerName `
+                            -Disks $diagnostic.Details.Disks
+                    }
+                }
+            }
+        }
+        
+        # Save security metrics
+        foreach ($diagnostic in $ScanResult.Security) {
+            switch ($diagnostic.CheckName) {
+                "Windows_Updates" {
+                    if ($diagnostic.Details) {
+                        Save-WindowsUpdateMetric -ComputerName $computerName `
+                            -TotalUpdates $diagnostic.Details.TotalUpdates `
+                            -PendingUpdates $diagnostic.Details.PendingUpdates `
+                            -FailedUpdates $diagnostic.Details.FailedUpdates `
+                            -LastUpdateDate $diagnostic.Details.LastUpdateDate `
+                            -AutoUpdateEnabled $diagnostic.Details.AutoUpdateEnabled `
+                            -RebootRequired $diagnostic.Details.RebootRequired
+                    }
+                }
+                "Antivirus_Status" {
+                    if ($diagnostic.Details) {
+                        Save-AntivirusMetric -ComputerName $computerName `
+                            -AVProduct $diagnostic.Details.Product `
+                            -AVVersion $diagnostic.Details.Version `
+                            -DefinitionsVersion $diagnostic.Details.DefinitionsVersion `
+                            -DefinitionsDate $diagnostic.Details.DefinitionsDate `
+                            -RealTimeProtection $diagnostic.Details.RealTimeProtection `
+                            -LastScanDate $diagnostic.Details.LastScanDate `
+                            -ThreatCount $diagnostic.Details.ThreatCount
+                    }
+                }
+            }
+        }
+        
+        Write-EMSLog -Message "Saved metrics for $computerName to granular tables" -Severity 'Success' -Category 'Metrics'
+    }
+    catch {
+        Write-EMSLog -Message "Error saving metrics for $($ScanResult.Hostname): $_" -Severity 'Error' -Category 'Metrics'
+    }
 }
 
 function Start-MPLSQueue {
@@ -234,6 +334,13 @@ function Start-MPLSQueue {
         
         $results += $batchResults
         
+        # Save batch results to granular metrics
+        foreach ($result in $batchResults) {
+            if ($result.Status -eq 'Complete') {
+                Save-DiagnosticsToMetrics -ScanResult $result -Config $Config
+            }
+        }
+        
         # Delay between batches to prevent MPLS saturation
         if ($i -lt ($batches - 1)) {
             Write-EMSLog -Message "Delaying $($Config.BulkProcessing.DelayBetweenRemoteBatchesSeconds)s before next MPLS batch" `
@@ -245,4 +352,4 @@ function Start-MPLSQueue {
     return $results
 }
 
-Export-ModuleMember -Function Invoke-DataFetch, Start-HOQueue, Start-MPLSQueue
+Export-ModuleMember -Function Invoke-DataFetch, Start-HOQueue, Start-MPLSQueue, Save-DiagnosticsToMetrics

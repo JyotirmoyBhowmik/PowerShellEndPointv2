@@ -35,6 +35,59 @@
     "TimeoutSeconds": 30,
     "FallbackToDC": true
   },
+  "Authentication": {
+    "Providers": [
+      {
+        "Name": "Standalone",
+        "Enabled": true,
+        "Priority": 1,
+        "AllowRegistration": false
+      },
+      {
+        "Name": "ActiveDirectory",
+        "Enabled": true,
+        "Domain": "corp.local",
+        "Priority": 2
+      },
+      {
+        "Name": "LDAP",
+        "Enabled": false,
+        "Server": "ldap.company.com",
+        "Port": 389,
+        "BaseDN": "dc=company,dc=com",
+        "BindDN": "cn=ems_svc,ou=services,dc=company,dc=com",
+        "BindPassword": "",
+        "Priority": 3
+      },
+      {
+        "Name": "ADFS",
+        "Enabled": false,
+        "ServerURL": "https://adfs.company.com",
+        "RelyingPartyIdentifier": "urn:ems:app",
+        "Priority": 4
+      },
+      {
+        "Name": "SSO",
+        "Enabled": false,
+        "Provider": "AzureAD",
+        "TenantID": "",
+        "ClientID": "",
+        "ClientSecret": "",
+        "Priority": 5
+      }
+    ],
+    "FallbackChain": true,
+    "SessionTimeoutMinutes": 480,
+    "MaxFailedAttempts": 5,
+    "LockoutDurationMinutes": 30
+  },
+  "Monitoring": {
+    "AllowStandaloneSystems": true,
+    "RequireDomainJoin": false,
+    "AutoDiscoverComputers": false,
+    "ScanIntervalMinutes": 60,
+    "MetricRetentionDays": 90
+  },
   "Database": {
     "Provider": "PostgreSQL",
     "Host": "localhost",

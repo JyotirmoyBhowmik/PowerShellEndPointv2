@@ -1,224 +1,287 @@
 <#
 .SYNOPSIS
-    Security posture and forensics diagnostic checks
-
+    Enhanced Security Posture Diagnostics - Structured Output
+    
 .DESCRIPTION
-    Implements 20 security checks including BIOS security, LAPS, Shadow Admins, USB forensics, BitLocker, etc.
+    Returns structured security metric data for granular tables
+    Includes monitoring for Zscaler security client
 #>
 
-function Test-SecureBoot {
-    param([string]$ComputerName)
-    
-    try {
-        $scriptBlock = {
-            try {
-                $secureBootEnabled = Confirm-SecureBootUEFI
-                return @{ Enabled = $secureBootEnabled; Error = $null }
-            }
-            catch {
-                return @{ Enabled = $false; Error = $_.Exception.Message }
-            }
-        }
-        
-        if ($ComputerName) {
-            $result = Invoke-Command -ComputerName $ComputerName -ScriptBlock $scriptBlock
-        }
-        else {
-            $result = & $scriptBlock
-        }
-        
-        $status = if ($result.Enabled) { 'OK' } else { 'Critical' }
-        $value = if ($result.Error) { "Not Supported" } elseif ($result.Enabled) { "Enabled" } else { "Disabled" }
-        
-        return [PSCustomObject]@{
-            Check      = 'Secure Boot'
-            Result     = $value
-            Compliance = $status
-            RiskLevel  = if ($status -eq 'OK') { 'Low' } else { 'High' }
-        }
-    }
-    catch {
-        return [PSCustomObject]@{
-            Check      = 'Secure Boot'
-            Result     = "Error: $_"
-            Compliance = 'Error'
-            RiskLevel  = 'Unknown'
-        }
-    }
-}
-
-function Get-LAPSStatus {
-    param([string]$ComputerName)
-    
-    try {
-        Import-Module ActiveDirectory -ErrorAction Stop
-        
-        $computer = Get-ADComputer $ComputerName -Properties 'ms-Mcs-AdmPwdExpirationTime' -ErrorAction Stop
-        
-        $expirationTime = $computer.'ms-Mcs-AdmPwdExpirationTime'
-        
-        if ($expirationTime) {
-            $expDate = [DateTime]::FromFileTime($expirationTime)
-            $isExpired = $expDate -lt (Get-Date)
-            
-            $status = if ($isExpired) { 'Critical' } else { 'OK' }
-            
-            return [PSCustomObject]@{
-                Check      = 'LAPS Password Status'
-                Result     = "Expires: $expDate $(if ($isExpired) { '(EXPIRED)' })"
-                Compliance = $status
-                RiskLevel  = if ($status -eq 'OK') { 'Low' } else { 'Critical' }
-            }
-        }
-        else {
-            return [PSCustomObject]@{
-                Check      = 'LAPS Password Status'
-                Result     = 'LAPS not configured or password not set'
-                Compliance = 'Critical'
-                RiskLevel  = 'High'
-            }
-        }
-    }
-    catch {
-        return [PSCustomObject]@{
-            Check      = 'LAPS Password Status'
-            Result     = "Error: $_"
-            Compliance = 'Error'
-            RiskLevel  = 'Unknown'
-        }
-    }
-}
-
-function Get-LocalAdministrators {
+function Get-WindowsUpdateMetricData {
     param([string]$ComputerName, [CimSession]$CimSession)
     
     try {
         $scriptBlock = {
-            $admins = Get-LocalGroupMember -Group 'Administrators' | Select-Object -ExpandProperty Name
-            return $admins -join '; '
+            $updateSession = New-Object -ComObject Microsoft.Update.Session
+            $updateSearcher = $updateSession.CreateUpdateSearcher()
+            $searchResult = $updateSearcher.Search("IsInstalled=0")
+            $pendingUpdates = $searchResult.Updates.Count
+            
+            # Get last update time
+            $lastUpdate = Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 1
+            
+            # Check auto-update settings
+            $au = New-Object -ComObject Microsoft.Update.AutoUpdate
+            $auEnabled = $au.ServiceEnabled
+            
+            # Check reboot requirement
+            $rebootRequired = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" -ErrorAction SilentlyContinue) -ne $null
+            
+            return @{
+                PendingUpdates    = $pendingUpdates
+                TotalUpdates      = $searchResult.Updates.Count
+                FailedUpdates     = 0 # Would need to query update history
+                LastUpdateDate    = if ($lastUpdate) { $lastUpdate.InstalledOn } else { $null }
+                AutoUpdateEnabled = $auEnabled
+                RebootRequired    = $rebootRequired
+            }
         }
         
-        if ($ComputerName) {
-            $adminList = Invoke-Command -ComputerName $ComputerName -ScriptBlock $scriptBlock
+        $result = if ($ComputerName) {
+            Invoke-Command -ComputerName $ComputerName -ScriptBlock $scriptBlock
         }
         else {
-            $adminList = & $scriptBlock
+            & $scriptBlock
         }
         
-        # Check for unexpected admins (anything other than Domain Admins or LAPS account)
-        $status = if ($adminList -match 'Domain Admins') { 'OK' } else { 'Warning' }
-        
-        return [PSCustomObject]@{
-            Check      = 'Local Administrators'
-            Result     = $adminList
-            Compliance = $status
-            RiskLevel  = if ($status -eq 'OK') { 'Low' } else { 'Medium' }
+        return @{
+            CheckName = "Windows_Updates"
+            Status    = if ($result.PendingUpdates -gt 20) { 'Critical' } elseif ($result.PendingUpdates -gt 5) { 'Warning' } else { 'OK' }
+            Details   = $result
         }
     }
     catch {
-        return [PSCustomObject]@{
-            Check      = 'Local Administrators'
-            Result     = "Error: $_"
-            Compliance = 'Error'
-            RiskLevel  = 'Unknown'
-        }
+        return @{ CheckName = "Windows_Updates"; Status = 'Error'; Details = $null }
     }
 }
 
-function Get-BitLockerStatus {
+function Get-AntivirusMetricData {
     param([string]$ComputerName, [CimSession]$CimSession)
     
     try {
-        $volumes = if ($CimSession) {
-            Get-CimInstance -CimSession $CimSession -Namespace 'Root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume
+        $av = if ($CimSession) {
+            Get-CimInstance -CimSession $CimSession -Namespace "root\SecurityCenter2" -ClassName AntivirusProduct
         }
         else {
-            Get-CimInstance -ComputerName $ComputerName -Namespace 'Root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume
+            Get-CimInstance -ComputerName $ComputerName -Namespace "root\SecurityCenter2" -ClassName AntivirusProduct
         }
         
-        $results = @()
-        foreach ($vol in $volumes | Where-Object { $_.DriveLetter }) {
-            $protectionStatus = switch ($vol.ProtectionStatus) {
-                0 { 'Unprotected' }
-                1 { 'Protected' }
-                2 { 'Unknown' }
-                default { 'Unknown' }
+        if ($av) {
+            # Get Windows Defender status if present
+            $defender = if ($CimSession) {
+                Get-CimInstance -CimSession $CimSession -Namespace "root\Microsoft\Windows\Defender" -ClassName MSFT_MpComputerStatus -ErrorAction SilentlyContinue
+            }
+            else {
+                Get-CimInstance -ComputerName $ComputerName -Namespace "root\Microsoft\Windows\Defender" -ClassName MSFT_MpComputerStatus -ErrorAction SilentlyContinue
             }
             
-            $status = if ($protectionStatus -eq 'Protected') { 'OK' } else { 'Critical' }
-            
-            $results += [PSCustomObject]@{
-                Check      = "BitLocker - $($vol.DriveLetter)"
-                Result     = "$protectionStatus (Encryption: $($vol.EncryptionPercentage)%)"
-                Compliance = $status
-                RiskLevel  = if ($status -eq 'OK') { 'Low' } else { 'Critical' }
+            return @{
+                CheckName = "Antivirus_Status"
+                Status    = if ($defender -and $defender.RealTimeProtectionEnabled) { 'OK' } else { 'Critical' }
+                Details   = @{
+                    Product            = if ($defender) { "Windows Defender" } else { $av.displayName }
+                    Version            = if ($defender) { $defender.AMProductVersion } else { "Unknown" }
+                    DefinitionsVersion = if ($defender) { $defender.AntivirusSignatureVersion } else { "Unknown" }
+                    DefinitionsDate    = if ($defender) { $defender.AntivirusSignatureLastUpdated } else { $null }
+                    RealTimeProtection = if ($defender) { $defender.RealTimeProtectionEnabled } else { $false }
+                    LastScanDate       = if ($defender) { $defender.QuickScanEndTime } else { $null }
+                    ThreatCount        = if ($defender) { $defender.TotalThreatsCount } else { 0 }
+                }
             }
         }
-        
-        return $results
+        else {
+            return @{
+                CheckName = "Antivirus_Status"
+                Status    = 'Critical'
+                Details   = @{ Product = "None"; RealTimeProtection = $false }
+            }
+        }
     }
     catch {
-        return [PSCustomObject]@{
-            Check      = 'BitLocker Status'
-            Result     = "Error or not supported: $_"
-            Compliance = 'Error'
-            RiskLevel  = 'Unknown'
-        }
+        return @{ CheckName = "Antivirus_Status"; Status = 'Error'; Details = $null }
     }
 }
 
-function Get-USBHistory {
-    param([string]$ComputerName)
+function Get-FirewallMetricData {
+    param([string]$ComputerName, [CimSession]$CimSession)
     
     try {
         $scriptBlock = {
-            $usbDevices = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR\*\*' -ErrorAction SilentlyContinue | 
-            Select-Object FriendlyName, Mfg -Unique
+            $profiles = Get-NetFirewallProfile
             
-            return $usbDevices
+            $profileData = @()
+            foreach ($profile in $profiles) {
+                $profileData += @{
+                    ProfileName           = $profile.Name
+                    Enabled               = $profile.Enabled
+                    DefaultInboundAction  = $profile.DefaultInboundAction.ToString()
+                    DefaultOutboundAction = $profile.DefaultOutboundAction.ToString()
+                }
+            }
+            return $profileData
         }
         
-        if ($ComputerName) {
-            $devices = Invoke-Command -ComputerName $ComputerName -ScriptBlock $scriptBlock
+        $result = if ($ComputerName) {
+            Invoke-Command -ComputerName $ComputerName -ScriptBlock $scriptBlock
         }
         else {
-            $devices = & $scriptBlock
+            & $scriptBlock
         }
         
-        if ($devices) {
-            $deviceList = ($devices | ForEach-Object { "$($_.FriendlyName) ($($_.Mfg))" }) -join '; '
-            $count = ($devices | Measure-Object).Count
+        $allEnabled = ($result | Where-Object { -not $_.Enabled }).Count -eq 0
+        
+        return @{
+            CheckName = "Firewall_Status"
+            Status    = if ($allEnabled) { 'OK' } else { 'Critical' }
+            Details   = @{ Profiles = $result }
+        }
+    }
+    catch {
+        return @{ CheckName = "Firewall_Status"; Status = 'Error'; Details = $null }
+    }
+}
+
+function Get-BitLockerMetricData {
+    param([string]$ComputerName, [CimSession]$CimSession)
+    
+    try {
+        $scriptBlock = {
+            $volumes = Get-BitLockerVolume
             
-            return [PSCustomObject]@{
-                Check      = 'USB Device History'
-                Result     = "$count device(s) detected: $deviceList"
-                Compliance = 'Info'
-                RiskLevel  = 'Low'
+            $volumeData = @()
+            foreach ($vol in $volumes) {
+                $volumeData += @{
+                    MountPoint           = $vol.MountPoint
+                    EncryptionMethod     = $vol.EncryptionMethod.ToString()
+                    ProtectionStatus     = $vol.ProtectionStatus.ToString()
+                    EncryptionPercentage = $vol.EncryptionPercentage
+                    VolumeStatus         = $vol.VolumeStatus.ToString()
+                }
+            }
+            return $volumeData
+        }
+        
+        $result = if ($ComputerName) {
+            Invoke-Command -ComputerName $ComputerName -ScriptBlock $scriptBlock
+        }
+        else {
+            & $scriptBlock
+        }
+        
+        $allEncrypted = ($result | Where-Object { $_.ProtectionStatus -ne "On" }).Count -eq 0
+        
+        return @{
+            CheckName = "BitLocker_Status"
+            Status    = if ($allEncrypted) { 'OK' } else { 'Warning' }
+            Details   = @{ Volumes = $result }
+        }
+    }
+    catch {
+        return @{ CheckName = "BitLocker_Status"; Status = 'Error'; Details = $null }
+    }
+}
+
+function Get-TPMMetricData {
+    param([string]$ComputerName, [CimSession]$CimSession)
+    
+    try {
+        $tpm = if ($CimSession) {
+            Get-CimInstance -CimSession $CimSession -Namespace "root\CIMv2\Security\MicrosoftTpm" -ClassName Win32_Tpm -ErrorAction SilentlyContinue
+        }
+        else {
+            Get-CimInstance -ComputerName $ComputerName -Namespace "root\CIMv2\Security\MicrosoftTpm" -ClassName Win32_Tpm -ErrorAction SilentlyContinue
+        }
+        
+        if ($tpm) {
+            return @{
+                CheckName = "TPM_Status"
+                Status    = if ($tpm.IsActivated_InitialValue -and $tpm.IsEnabled_InitialValue) { 'OK' } else { 'Warning' }
+                Details   = @{
+                    Present      = $true
+                    Enabled      = $tpm.IsEnabled_InitialValue
+                    Activated    = $tpm.IsActivated_InitialValue
+                    Version      = $tpm.SpecVersion
+                    Manufacturer = $tpm.ManufacturerIdTxt
+                }
             }
         }
         else {
-            return [PSCustomObject]@{
-                Check      = 'USB Device History'
-                Result     = 'No USB devices detected'
-                Compliance = 'OK'
-                RiskLevel  = 'Low'
+            return @{
+                CheckName = "TPM_Status"
+                Status    = 'Warning'
+                Details   = @{ Present = $false }
             }
         }
     }
     catch {
-        return [PSCustomObject]@{
-            Check      = 'USB Device History'
-            Result     = "Error: $_"
-            Compliance = 'Error'
-            RiskLevel  = 'Unknown'
+        return @{ CheckName = "TPM_Status"; Status = 'Error'; Details = $null }
+    }
+}
+
+function Get-ZscalerStatusMetricData {
+    <#
+    .SYNOPSIS
+        Monitors Zscaler security client status
+    #>
+    param([string]$ComputerName, [CimSession]$CimSession)
+    
+    try {
+        $scriptBlock = {
+            # Check if Zscaler is installed
+            $zscaler = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" | 
+            Where-Object { $_.DisplayName -like "*Zscaler*" }
+            
+            if ($zscaler) {
+                # Check Zscaler service
+                $service = Get-Service -Name "ZscalerService" -ErrorAction SilentlyContinue
+                
+                # Check Zscaler app running
+                $process = Get-Process -Name "Zscaler*" -ErrorAction SilentlyContinue
+                
+                return @{
+                    Installed          = $true
+                    Version            = $zscaler.DisplayVersion
+                    ServiceRunning     = ($service -and $service.Status -eq 'Running')
+                    ApplicationRunning = ($process -ne $null)
+                    ServiceStatus      = if ($service) { $service.Status.ToString() } else { "Not Found" }
+                }
+            }
+            else {
+                return @{
+                    Installed          = $false
+                    Version            = $null
+                    ServiceRunning     = $false
+                    ApplicationRunning = $false
+                }
+            }
         }
+        
+        $result = if ($ComputerName) {
+            Invoke-Command -ComputerName $ComputerName -ScriptBlock $scriptBlock
+        }
+        else {
+            & $scriptBlock
+        }
+        
+        $status = if ($result.Installed -and $result.ServiceRunning) { 'OK' } 
+        elseif ($result.Installed) { 'Warning' } 
+        else { 'Critical' }
+        
+        return @{
+            CheckName = "Zscaler_Status"
+            Status    = $status
+            Details   = $result
+        }
+    }
+    catch {
+        return @{ CheckName = "Zscaler_Status"; Status = 'Error'; Details = $null }
     }
 }
 
 function Invoke-SecurityChecks {
     <#
     .SYNOPSIS
-        Runs all security posture checks
+        Runs all security posture checks including Zscaler
     #>
     param(
         [string]$ComputerName,
@@ -227,20 +290,14 @@ function Invoke-SecurityChecks {
     
     $results = @()
     
-    $results += Test-SecureBoot -ComputerName $ComputerName
-    $results += Get-LAPSStatus -ComputerName $ComputerName
-    $results += Get-LocalAdministrators -ComputerName $ComputerName -CimSession $CimSession
-    $results += Get-BitLockerStatus -ComputerName $ComputerName -CimSession $CimSession
-    $results += Get-USBHistory -ComputerName $ComputerName
-    
-    # Additional security checks would go here:
-    # - Firewall status
-    # - Anti-virus status
-    # - UAC settings
-    # - Shadow Admin detection (complex ACL analysis)
-    # - BIOS password verification
+    $results += Get-WindowsUpdateMetricData -ComputerName $ComputerName -CimSession $CimSession
+    $results += Get-AntivirusMetricData -ComputerName $ComputerName -CimSession $CimSession
+    $results += Get-FirewallMetricData -ComputerName $ComputerName -CimSession $CimSession
+    $results += Get-BitLockerMetricData -ComputerName $ComputerName -CimSession $CimSession
+    $results += Get-TPMMetricData -ComputerName $ComputerName -CimSession $CimSession
+    $results += Get-ZscalerStatusMetricData -ComputerName $ComputerName -CimSession $CimSession
     
     return $results
 }
 
-Export-ModuleMember -Function Invoke-SecurityChecks, Test-*, Get-*
+Export-ModuleMember -Function Invoke-SecurityChecks, Get-*MetricData

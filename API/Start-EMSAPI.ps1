@@ -23,7 +23,9 @@
 $ModulePath = Join-Path $PSScriptRoot "..\Modules"
 Import-Module "$ModulePath\Logging.psm1" -Force
 Import-Module "$ModulePath\Database\PSPGSql.psm1" -Force
+Import-Module "$ModulePath\Database\MetricsData.psm1" -Force
 Import-Module "$ModulePath\Authentication.psm1" -Force
+Import-Module "$ModulePath\Authentication\AuthProviders.psm1" -Force
 Import-Module "$ModulePath\InputBroker.psm1" -Force
 Import-Module "$ModulePath\DataFetcher.psm1" -Force
 Import-Module "$ModulePath\Remediation.psm1" -Force
@@ -123,51 +125,47 @@ $authEndpoints = @(
         
         try {
             $credentials = $Body | ConvertFrom-Json
+            $provider = $credentials.provider  # Optional: Standalone, ActiveDirectory, LDAP, etc.
             
-            # Validate credentials against AD
+            # Use multi-provider authentication
             $securePassword = ConvertTo-SecureString $credentials.password -AsPlainText -Force
-            $isValid = Test-ADCredential -Username $credentials.username -SecurePassword $securePassword
+            $authResult = Invoke-MultiProviderAuth -Username $credentials.username -SecurePassword $securePassword -Provider $provider -Config $Global:EMSConfig
             
-            if (-not $isValid) {
+            if (-not $authResult.Success) {
+                Write-AuditLog -Action "Login" -User $credentials.username -Result "Failed" -RiskLevel "Medium"
                 New-UDEndpointResponse -StatusCode 401 -Data @{
                     success = $false
-                    message = "Invalid credentials"
+                    message = if ($authResult.Message) { $authResult.Message } else { "Invalid credentials" }
                 } | ConvertTo-Json
                 return
             }
             
-            # Check authorization
-            $isAuthorized = Test-UserAuthorization -Username $credentials.username -RequiredGroup $Global:EMSConfig.Security.AdminGroup
-            
-            if (-not $isAuthorized) {
-                Write-AuditLog -Action "Login" -User $credentials.username -Result "Unauthorized" -RiskLevel "Medium"
-                
-                New-UDEndpointResponse -StatusCode 403 -Data @{
-                    success = $false
-                    message = "User not authorized. Must be member of $($Global:EMSConfig.Security.AdminGroup)"
-                } | ConvertTo-Json
-                return
+            # For AD users, check authorization
+            if ($authResult.Provider -eq "ActiveDirectory") {
+                $isAuthorized = Test-UserAuthorization -Username $credentials.username -RequiredGroup $Global:EMSConfig.Security.AdminGroup
+                if (-not $isAuthorized) {
+                    Write-AuditLog -Action "Login" -User $credentials.username -Result "Unauthorized" -RiskLevel "Medium"
+                    New-UDEndpointResponse -StatusCode 403 -Data @{
+                        success = $false
+                        message = "User not authorized. Must be member of $($Global:EMSConfig.Security.AdminGroup)"
+                    } | ConvertTo-Json
+                    return
+                }
             }
             
             # Get or create user in database
-            $dbUser = Get-EMSUser -Username $credentials.username
-            if (-not $dbUser) {
-                $userId = New-EMSUser -Username $credentials.username -Role "operator"
-                $dbUser = Get-EMSUser -UserId $userId
-            }
-            
-            # Update last login
-            Update-EMSUserLogin -UserId $dbUser.user_id
+            $dbUser = Get-OrCreateAuthUser -AuthResult $authResult -Config $Global:EMSConfig
             
             # Generate JWT token
-            $token = New-JWTToken -Username $credentials.username -UserId $dbUser.user_id -Role $dbUser.role
+            $token = New-JWTToken -Username $authResult.User -UserId $dbUser.user_id -Role $dbUser.role
             
-            Write-AuditLog -Action "Login" -User $credentials.username -Result "Success" -RiskLevel "Low"
+            Write-AuditLog -Action "Login" -User $authResult.User -Result "Success" -RiskLevel "Low" -Details "Provider: $($authResult.Provider)"
             
             New-UDEndpointResponse -StatusCode 200 -Data @{
-                success = $true
-                token   = $token
-                user    = @{
+                success  = $true
+                token    = $token
+                provider = $authResult.Provider
+                user     = @{
                     id          = $dbUser.user_id
                     username    = $dbUser.username
                     displayName = $dbUser.display_name
@@ -343,6 +341,93 @@ $resultsEndpoints = @(
     }
 )
 
+# Computer Management Endpoints
+$computerEndpoints = @(
+    New-UDEndpoint -Url "/api/auth/providers" -Method GET -Endpoint {
+        # Return available auth providers
+        $providers = $Global:EMSConfig.Authentication.Providers | Where-Object { $_.Enabled } | Select-Object Name, @{N = 'RequiresCredentials'; E = { $_.Name -ne 'SSO' } }
+        New-UDEndpointResponse -StatusCode 200 -Data @{
+            providers = $providers
+        } | ConvertTo-Json
+    }
+    
+    New-UDEndpoint -Url "/api/computers" -Method GET -Endpoint {
+        $authHeader = $Request.Headers['Authorization']
+        if (-not $authHeader) {
+            New-UDEndpointResponse -StatusCode 401 -Data @{ error = "Unauthorized" } | ConvertTo-Json
+            return
+        }
+        
+        try {
+            $limit = if ($Request.Query['limit']) { [int]$Request.Query['limit'] } else { 100 }
+            $computers = Get-AllComputers -Limit $limit
+            
+            New-UDEndpointResponse -StatusCode 200 -Data @{
+                success   = $true
+                computers = $computers
+                count     = $computers.Count
+            } | ConvertTo-Json -Depth 5
+        }
+        catch {
+            New-UDEndpointResponse -StatusCode 500 -Data @{ error = $_.Exception.Message } | ConvertTo-Json
+        }
+    }
+    
+    New-UDEndpoint -Url "/api/computers/:name" -Method GET -Endpoint {
+        param($name)
+        
+        $authHeader = $Request.Headers['Authorization']
+        if (-not $authHeader) {
+            New-UDEndpointResponse -StatusCode 401 -Data @{ error = "Unauthorized" } | ConvertTo-Json
+            return
+        }
+        
+        try {
+            $computer = Invoke-PGQuery -Query "SELECT * FROM computers WHERE computer_name = @name" -Parameters @{ name = $name }
+            if ($computer) {
+                # Get associated users
+                $users = Invoke-PGQuery -Query "SELECT * FROM computer_ad_users WHERE computer_name = @name" -Parameters @{ name = $name }
+                $computer | Add-Member -NotePropertyName "users" -NotePropertyValue $users -Force
+                
+                # Get latest metrics
+                $metrics = Get-ComputerMetrics -ComputerName $name
+                $computer | Add-Member -NotePropertyName "metrics" -NotePropertyValue $metrics -Force
+                
+                New-UDEndpointResponse -StatusCode 200 -Data $computer | ConvertTo-Json -Depth 10
+            }
+            else {
+                New-UDEndpointResponse -StatusCode 404 -Data @{ error = "Computer not found" } | ConvertTo-Json
+            }
+        }
+        catch {
+            New-UDEndpointResponse -StatusCode 500 -Data @{ error = $_.Exception.Message } | ConvertTo-Json
+        }
+    }
+    
+    New-UDEndpoint -Url "/api/computers" -Method POST -Endpoint {
+        param($Body)
+        
+        $authHeader = $Request.Headers['Authorization']
+        if (-not $authHeader) {
+            New-UDEndpointResponse -StatusCode 401 -Data @{ error = "Unauthorized" } | ConvertTo-Json
+            return
+        }
+        
+        try {
+            $computer = $Body | ConvertFrom-Json
+            Register-Computer -ComputerName $computer.name -IPAddress $computer.ip -IsDomainJoined $false -ComputerType $computer.type
+            
+            New-UDEndpointResponse -StatusCode 201 -Data @{
+                success = $true
+                message = "Computer registered successfully"
+            } | ConvertTo-Json
+        }
+        catch {
+            New-UDEndpointResponse -StatusCode 500 -Data @{ error = $_.Exception.Message } | ConvertTo-Json
+        }
+    }
+)
+
 # Dashboard Endpoints
 $dashboardEndpoints = @(
     New-UDEndpoint -Url "/api/dashboard/stats" -Method GET -Endpoint {
@@ -380,7 +465,7 @@ $apiConfig = $Global:EMSConfig.API
 $cors = New-UDCorsPolicy -AllowedOrigin $apiConfig.AllowedOrigins -AllowedMethod @('GET', 'POST', 'PUT', 'DELETE', 'OPTIONS') -AllowedHeader @('Authorization', 'Content-Type')
 
 # Combine all endpoints
-$allEndpoints = $authEndpoints + $scanEndpoints + $resultsEndpoints + $dashboardEndpoints
+$allEndpoints = $authEndpoints + $scanEndpoints + $resultsEndpoints + $computerEndpoints + $dashboardEndpoints
 
 # Create dashboard
 $dashboard = New-UDDashboard -Title "EMS API Server" -Content {
@@ -408,9 +493,13 @@ Write-Host "Address: $($apiConfig.ListenAddress)" -ForegroundColor Cyan
 Write-Host "Endpoints:" -ForegroundColor Yellow
 Write-Host "  POST   /api/auth/login" -ForegroundColor White
 Write-Host "  GET    /api/auth/validate" -ForegroundColor White
+Write-Host "  GET    /api/auth/providers" -ForegroundColor White
 Write-Host "  POST   /api/scan/single" -ForegroundColor White
 Write-Host "  GET    /api/results" -ForegroundColor White
 Write-Host "  GET    /api/results/:id" -ForegroundColor White
+Write-Host "  GET    /api/computers" -ForegroundColor White
+Write-Host "  GET    /api/computers/:name" -ForegroundColor White
+Write-Host "  POST   /api/computers" -ForegroundColor White
 Write-Host "  GET    /api/dashboard/stats" -ForegroundColor White
 Write-Host "`nPress Ctrl+C to stop the server" -ForegroundColor Yellow
 Write-Host "========================================`n" -ForegroundColor Green

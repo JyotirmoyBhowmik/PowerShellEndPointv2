@@ -35,8 +35,8 @@ apiClient.interceptors.response.use(
 );
 
 export const authService = {
-    login: async (username, password) => {
-        const response = await apiClient.post('/auth/login', { username, password });
+    login: async (username, password, provider = null) => {
+        const response = await apiClient.post('/auth/login', { username, password, provider });
         if (response.data.success && response.data.token) {
             localStorage.setItem('auth_token', response.data.token);
             localStorage.setItem('user', JSON.stringify(response.data.user));
@@ -65,6 +65,11 @@ export const authService = {
 
     isAuthenticated: () => {
         return !!localStorage.getItem('auth_token');
+    },
+
+    getProviders: async () => {
+        const response = await apiClient.get('/auth/providers');
+        return response.data;
     }
 };
 
@@ -91,6 +96,28 @@ export const dashboardService = {
     getStats: async () => {
         const response = await apiClient.get('/dashboard/stats');
         return response.data.statistics;
+    }
+};
+
+export const computerService = {
+    getComputers: async (limit = 100) => {
+        const response = await apiClient.get(`/computers?limit=${limit}`);
+        return response.data;
+    },
+
+    getComputer: async (computerName) => {
+        const response = await apiClient.get(`/computers/${computerName}`);
+        return response.data;
+    },
+
+    registerComputer: async (computerData) => {
+        const response = await apiClient.post('/computers', computerData);
+        return response.data;
+    },
+
+    getComputerMetrics: async (computerName, metricType = 'all') => {
+        const response = await apiClient.get(`/computers/${computerName}/metrics?type=${metricType}`);
+        return response.data;
     }
 };
 
