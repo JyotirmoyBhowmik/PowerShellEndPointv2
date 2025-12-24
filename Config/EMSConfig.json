@@ -29,11 +29,40 @@
     "RequireConfirmation": true
   },
   "UserResolution": {
-    "UseSCCM": true,
-    "SCCMSiteServer": "SCCM01.corp.local",
+    "UseSCCM": false,
+    "SCCMSiteServer": "",
     "EventLogTimeWindowMinutes": 60,
     "TimeoutSeconds": 30,
     "FallbackToDC": true
+  },
+  "Database": {
+    "Provider": "PostgreSQL",
+    "Host": "localhost",
+    "Port": 5432,
+    "DatabaseName": "ems_production",
+    "Username": "ems_service",
+    "Password": "CHANGE_ME_SECURE_PASSWORD",
+    "PasswordFile": "",
+    "UseSSL": false,
+    "ConnectionPoolSize": 20
+  },
+  "API": {
+    "Enabled": true,
+    "ListenAddress": "http://localhost:5000",
+    "EnableSwagger": true,
+    "JWTSecretKey": "REPLACE_WITH_SECURE_RANDOM_KEY_MIN_32_CHARS",
+    "TokenExpirationMinutes": 60,
+    "EnableCORS": true,
+    "AllowedOrigins": [
+      "http://localhost:3000",
+      "http://localhost:8080"
+    ]
+  },
+  "WebUI": {
+    "URL": "http://localhost:3000",
+    "SessionTimeoutMinutes": 30,
+    "EnableRealTimeUpdates": true,
+    "RefreshIntervalSeconds": 30
   },
   "BlacklistedSoftware": [
     "Dropbox",
